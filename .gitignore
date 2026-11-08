@@ -6,6 +6,8 @@ __pycache__/
 
 .vscode/
 
+qdrant_data/
+
 data/raw/*.pdf
 data/processed/*
 !data/processed/.gitkeep

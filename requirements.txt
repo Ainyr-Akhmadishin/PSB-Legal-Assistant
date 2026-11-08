@@ -1,0 +1,22 @@
+# Для веба
+fastapi[standard]
+
+# LangChain и дополнения
+langchain-core
+langchain-community
+langchain-text-splitters
+
+# Модели
+langchain-gigachat
+langchain-openai
+
+# Векторная база данных 
+qdrant-client
+langchain-qdrant
+
+# Работа с документами
+sentence-transformers
+pypdf
+
+# Загрузка .env
+pydantic-settings
