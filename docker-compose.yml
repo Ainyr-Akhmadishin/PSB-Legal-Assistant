@@ -1,11 +1,40 @@
-services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    restart: unless-stopped
-    container_name: qdrant
-    ports:
-      - 6333:6333
-      - 6334:6334
-    volumes:
-      - ./qdrant_data:/qdrant/storage
+version: "3.8"
 
+services:
+  api:
+    build: .
+    container_name: psb-legal-api
+    environment:
+      - DATA_DIR=/app/data
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - EMB_MODEL=${EMB_MODEL}
+      - RERANKER_MODEL=${RERANKER_MODEL}
+      - RERANKER_TOP_N=${RERANKER_TOP_N}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  ui:
+    build: .
+    container_name: psb-legal-ui
+    command: streamlit run src/ui/streamlit_app.py --server.port=8501 --server.address=0.0.0.0
+    environment:
+      - API_URL=http://api:8000/answer
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  data:

@@ -1,22 +1,20 @@
-# Для веба
-fastapi[standard]
+# Core dependencies for PSB Legal Assistant
+fastapi==0.143.2
+uvicorn==0.54.0
+pydantic==2.14.2
+python-multipart==0.0.20
+python-dotenv==1.1.1
+httpx==0.28.1
+requests==2.32.5
+numpy==2.2.6
+rank-bm25==0.2.2
+rapidfuzz==3.14.1
+pypdf==6.21.4
+python-docx==1.2.0
+beautifulsoup4==4.14.2
+lxml==6.0.2
+PyYAML==6.0.3
+tiktoken==0.12.0
 
-# LangChain и дополнения
-langchain-core
-langchain-community
-langchain-text-splitters
-
-# Модели
-langchain-gigachat
-langchain-openai
-
-# Векторная база данных 
-qdrant-client
-langchain-qdrant
-
-# Работа с документами
-sentence-transformers
-pypdf
-
-# Загрузка .env
-pydantic-settings
+# Optional for development/testing
+streamlit==1.43.2
