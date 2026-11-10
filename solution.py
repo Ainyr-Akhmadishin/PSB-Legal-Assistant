@@ -28,6 +28,66 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env', override=False)
 
+
+# --------------------------- helpers --------------------------------------
+
+def env(name: str, default: str = '') -> str:
+    value = os.getenv(name, '').strip()
+    return default if not value or value == name else value
+
+
+def env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(env(name))))
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float, low: float = 0.0, high: float = 2.0) -> float:
+    try:
+        return max(low, min(high, float(env(name))))
+    except ValueError:
+        return default
+
+
+# --------------------------- env (как в примере) ---------------------------
+
+# Пути к данным
+DATA_DIR = Path(env('DATA_DIR', 'data'))
+KB_PATH_ENV = env('KB_PATH', '')
+
+# LLM (генерация)
+LLM_BASE_URL = (env('LLM_BASE_URL') or env('BASE_URL') or env('OPENAI_BASE_URL')).rstrip('/')
+LLM_API_KEY = env('LLM_API_KEY') or env('OPENAI_API_KEY')
+LLM_MODEL = (env('LLM_MODEL') or env('GEN_MODEL') or env('OPENAI_MODEL')
+             or 'deepseek-v4.1-flash')
+
+# Embeddings
+EMBEDDER_BASE_URL = (env('EMBEDDER_BASE_URL') or LLM_BASE_URL).rstrip('/')
+EMBEDDER_API_KEY = env('EMBEDDER_API_KEY') or LLM_API_KEY
+EMB_MODEL = env('EMB_MODEL', 'BAAI/bge-m3')
+
+# Reranker
+RERANKER_BASE_URL = (env('RERANKER_BASE_URL') or LLM_BASE_URL).rstrip('/')
+RERANKER_API_KEY = env('RERANKER_API_KEY') or LLM_API_KEY
+RERANKER_MODEL = env('RERANKER_MODEL', 'Qwen3-Reranker-8B')
+_RERANKER_FLAG = env('RERANKER_ENABLED', '1').strip().lower()
+RERANKER_ENABLED = _RERANKER_FLAG not in ('0', 'false', 'off', 'no')
+RERANKER_TOP_N = env_int('RERANKER_TOP_N', 10, 1, 30)
+
+# Поиск / генерация
+TOP_K = env_int('TOP_K', 4, 1, 8)         # для совместимости с примером, у нас своя логика
+CHUNKER = env('CHUNKER', 'common')        # для совместимости, у нас свой chunker
+TEMPERATURE = env_float('TEMPERATURE', 0.0)
+MAX_TOKENS = env_int('MAX_TOKENS', 1600, 128, 8192)
+MAX_WORKERS = env_int('MAX_WORKERS', 2, 1, 8)
+
+# Пороги отказа
+MIN_VECTOR_SCORE = env_float('MIN_VECTOR_SCORE', 0.20, 0.0, 1.0)
+MIN_TERM_OVERLAP = env_int('MIN_TERM_OVERLAP', 1, 0, 100)
+
+# --------------------------- константы ------------------------------------
+
 REFUSAL = (
     'В предоставленной базе знаний недостаточно подтверждённых сведений '
     'для достоверного ответа на этот вопрос.'
@@ -112,9 +172,9 @@ def error_summary(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         return f'HTTP {exc.response.status_code} на {exc.request.url.path}'
     if isinstance(exc, httpx.ConnectError):
-        return 'Соединение с API не установлено; проверьте Ollama и LLM_BASE_URL'
+        return 'Соединение с API не установлено'
     if isinstance(exc, httpx.TimeoutException):
-        return 'Превышено время ожидания API (модель может загружаться)'
+        return 'Превышено время ожидания API'
     if isinstance(exc, (RuntimeError, ValueError, KeyError, IndexError, TypeError)):
         return f'{type(exc).__name__}: {exc}'
     return type(exc).__name__
@@ -149,15 +209,13 @@ def query_date(question: str) -> str | None:
 
 
 def find_knowledge_base() -> Path:
-    override = os.getenv('KB_PATH', '').strip()
+    override = KB_PATH_ENV
     if override:
         p = Path(override).expanduser()
         if p.exists():
             return p
         raise FileNotFoundError(f'KB_PATH указывает на несуществующий путь: {p}')
-    data_dir = Path(os.getenv('DATA_DIR', 'data'))
-    if not data_dir.is_absolute():
-        data_dir = ROOT / data_dir
+    data_dir = DATA_DIR if DATA_DIR.is_absolute() else ROOT / DATA_DIR
     names = ('kb.zip', 'knowledge-base.zip', 'knowledge_base.zip', 'knowledge_base', 'knowledge', 'documents')
     for directory in (data_dir, ROOT):
         for name in names:
@@ -302,27 +360,31 @@ def load_documents(source: Path) -> list[dict]:
 
 class ModelAPI:
     def __init__(self):
-        self.base = (os.getenv('LLM_BASE_URL') or os.getenv('BASE_URL') or os.getenv('OPENAI_BASE_URL') or '').rstrip('/')
-        self.key = (os.getenv('LLM_API_KEY') or os.getenv('OPENAI_API_KEY')
-                    or ('ollama' if is_local_ollama(self.base) else ''))
-        self.emb_base = (os.getenv('EMBEDDER_BASE_URL') or self.base).rstrip('/')
-        self.emb_key = (os.getenv('EMBEDDER_API_KEY') or self.key or ('ollama' if is_local_ollama(self.emb_base) else ''))
-        self.rer_base = (os.getenv('RERANKER_BASE_URL') or self.base).rstrip('/')
-        self.rer_key = os.getenv('RERANKER_API_KEY') or self.key
-        rer_setting = os.getenv('RERANKER_ENABLED', '').strip().lower()
-        self.reranker_enabled = (rer_setting not in ('0', 'false', 'off', 'no')
-                                 and not (rer_setting == '' and is_local_ollama(self.rer_base)))
-        self.embedding_model = os.getenv('EMB_MODEL', 'BAAI/bge-m3')
-        self.reranker_model = os.getenv('RERANKER_MODEL', 'Qwen3-Reranker-8B')
-        self.llm_model = os.getenv('LLM_MODEL') or os.getenv('GEN_MODEL') or 'deepseek-v4.1-flash'
+        self.base = LLM_BASE_URL
+        self.key = LLM_API_KEY or ('ollama' if is_local_ollama(self.base) else '')
+        self.emb_base = EMBEDDER_BASE_URL
+        self.emb_key = EMBEDDER_API_KEY or ('ollama' if is_local_ollama(self.emb_base) else '')
+        self.rer_base = RERANKER_BASE_URL
+        self.rer_key = RERANKER_API_KEY
+
+        # Реранкер: если локальный Ollama и флаг не выставлен — отключаем
+        flag_raw = os.getenv('RERANKER_ENABLED', '').strip().lower()
+        if flag_raw == '' and is_local_ollama(self.rer_base):
+            self.reranker_enabled = False
+        else:
+            self.reranker_enabled = RERANKER_ENABLED
+
+        self.embedding_model = EMB_MODEL
+        self.reranker_model = RERANKER_MODEL
+        self.llm_model = LLM_MODEL
         timeout = 180.0 if is_local_ollama(self.base) else 50.0
         self.client = httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0), follow_redirects=False)
 
     def post(self, base: str, key: str, route: str, payload: dict) -> dict:
         if not base:
-            raise RuntimeError('Не задан LLM_BASE_URL.')
+            raise RuntimeError('Не задан base URL (LLM_BASE_URL).')
         if not key:
-            raise RuntimeError('Не задан API-ключ для удалённой модели (LLM_API_KEY).')
+            raise RuntimeError('Не задан API-ключ (LLM_API_KEY).')
         response = self.client.post(base + route, json=payload, headers={'Authorization': 'Bearer ' + key})
         response.raise_for_status()
         return response.json()
@@ -340,8 +402,6 @@ class ModelAPI:
                 break
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
-                # 503/502/504 — временная перегрузка эмбеддера (например, Ollama
-                # под параллельной нагрузкой). Ретраим с нарастающей паузой.
                 if exc.response.status_code in (502, 503, 504):
                     pause = 2 * (attempt + 1)
                     log(f"[EMBED] {error_summary(exc)}; retry через {pause}s (попытка {attempt + 1}/3)")
@@ -379,13 +439,13 @@ class ModelAPI:
         log(f"[RERANK] Получено {len(results)} результатов")
         return results
 
-    def chat(self, messages: list[dict], max_tokens: int = 1600) -> str:
+    def chat(self, messages: list[dict]) -> str:
         if is_local_ollama(self.base):
             root = self.base.removesuffix('/v1').rstrip('/')
             result = self.client.post(
                 root + '/api/chat',
                 json={'model': self.llm_model, 'messages': messages, 'stream': False,
-                      'think': False, 'options': {'temperature': 0, 'num_predict': max_tokens}}
+                      'think': False, 'options': {'temperature': TEMPERATURE, 'num_predict': MAX_TOKENS}}
             )
             result.raise_for_status()
             content = (result.json().get('message') or {}).get('content')
@@ -393,10 +453,11 @@ class ModelAPI:
                 raise ValueError('Ollama вернула пустой ответ')
             return content.strip()
 
-        log(f"[LLM] Запрос: {len(messages)} сообщений, всего {sum(len(m.get('content','')) for m in messages)}b, model={self.llm_model}")
+        log(f"[LLM] Запрос: {len(messages)} сообщений, всего {sum(len(m.get('content','')) for m in messages)}b, "
+            f"model={self.llm_model}, T={TEMPERATURE}, max_tokens={MAX_TOKENS}")
         response = self.post(self.base, self.key, '/chat/completions',
                              {'model': self.llm_model, 'messages': messages,
-                              'temperature': 0, 'max_tokens': max_tokens})
+                              'temperature': TEMPERATURE, 'max_tokens': MAX_TOKENS})
         content = response['choices'][0]['message'].get('content')
         if not isinstance(content, str) or not content.strip():
             raise ValueError('Модель вернула пустой ответ в поле choices[0].message.content')
@@ -493,8 +554,10 @@ class LegalAssistant:
             out.append(c)
         return out
 
-    def search(self, question: str, top_n: int = 10) -> list[dict]:
-        log(f"\n[SEARCH] === {question[:120]!r} ===")
+    def search(self, question: str, top_n: int | None = None) -> list[dict]:
+        if top_n is None:
+            top_n = RERANKER_TOP_N
+        log(f"\n[SEARCH] === {question[:120]!r} === (top_n={top_n})")
         lex_scores = self.bm25(question)
         lexical = sorted((i for i, s in enumerate(lex_scores) if s > 0),
                          key=lambda i: lex_scores[i], reverse=True)[:40]
@@ -531,9 +594,6 @@ class LegalAssistant:
                 fused[idx] += 1 / (60 + rank + 1)
 
         # ГАРАНТИЯ: топ-5 Chroma всегда попадают в топ RRF.
-        # Закрывает кейс, когда точный пункт (например, п.2.4 регламента 2023
-        # с порогом 10 млн) семантически релевантен, но не совпадает по словам
-        # с вопросом ("12 млн" ≠ "10 000 000"), из-за чего BM25 его не видит.
         for idx in semantic[:5]:
             fused[idx] += 0.02
 
@@ -600,14 +660,16 @@ class LegalAssistant:
         max_vec = max(c['vector_score'] for c in candidates)
 
         log(f"[ANSWER] Вопрос: {question[:150]!r}")
-        log(f"[ANSWER] Кандидатов: {len(candidates)}, max_overlap={max_overlap}, max_bm25={max_lex:.3f}, max_vec={max_vec:.3f}")
+        log(f"[ANSWER] Кандидатов: {len(candidates)}, max_overlap={max_overlap}, "
+            f"max_bm25={max_lex:.3f}, max_vec={max_vec:.3f} (пороги: overlap<{MIN_TERM_OVERLAP}, "
+            f"vec<{MIN_VECTOR_SCORE})")
 
-        min_vec = float(os.getenv('MIN_VECTOR_SCORE', '0.20'))
-        if max_overlap == 0 and max_vec < min_vec:
-            log(f"[ANSWER] -> REFUSAL по порогам (overlap=0, vec={max_vec:.3f} < {min_vec})")
+        if max_overlap < MIN_TERM_OVERLAP and max_vec < MIN_VECTOR_SCORE:
+            log(f"[ANSWER] -> REFUSAL по порогам (overlap={max_overlap} < {MIN_TERM_OVERLAP}, "
+                f"vec={max_vec:.3f} < {MIN_VECTOR_SCORE})")
             return {'answer': REFUSAL, 'sources': []}
-        if max_lex <= 0 and max_vec < min_vec:
-            log(f"[ANSWER] -> REFUSAL по порогам (bm25=0, vec={max_vec:.3f} < {min_vec})")
+        if max_lex <= 0 and max_vec < MIN_VECTOR_SCORE:
+            log(f"[ANSWER] -> REFUSAL по порогам (bm25=0, vec={max_vec:.3f} < {MIN_VECTOR_SCORE})")
             return {'answer': REFUSAL, 'sources': []}
 
         def obsolete_label(c: dict) -> str:
@@ -699,13 +761,12 @@ def load_questions(path: Path) -> list[tuple[str, str]]:
 
 
 def run_csv(engine: LegalAssistant) -> None:
-    data_dir = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
-    if not data_dir.is_absolute():
-        data_dir = ROOT / data_dir
+    data_dir = DATA_DIR if DATA_DIR.is_absolute() else ROOT / DATA_DIR
     file = Path(os.getenv('QUESTIONS_CSV', str(data_dir / 'questions.csv')))
 
     questions = load_questions(file)
-    log(f"[CSV] Загружено вопросов: {len(questions)}")
+    log(f"[CSV] Загружено вопросов: {len(questions)}; MAX_WORKERS={MAX_WORKERS}, "
+        f"RERANKER_TOP_N={RERANKER_TOP_N}, TOP_K={TOP_K}, CHUNKER={CHUNKER}")
 
     def work(position: int, question: str) -> tuple[int, str]:
         for attempt in range(3):
@@ -720,7 +781,7 @@ def run_csv(engine: LegalAssistant) -> None:
         return position, REFUSAL
 
     answers = [REFUSAL] * len(questions)
-    max_workers = int(os.getenv("MAX_WORKERS", "2"))
+    max_workers = MAX_WORKERS  # уже зажат 1..8 через env_int
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(work, i, question) for i, (_, question) in enumerate(questions)]
@@ -743,7 +804,7 @@ if __name__ == '__main__':
     try:
         api = ModelAPI()
         if not api.base or not api.key:
-            raise RuntimeError(f'Не настроена модель. Проверьте {ROOT / ".env"}')
+            raise RuntimeError('Не настроена модель. Нужны LLM_BASE_URL и LLM_API_KEY (или аналоги).')
         engine = LegalAssistant(api=api)
         run_csv(engine)
     except Exception as exc:
