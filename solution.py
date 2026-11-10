@@ -103,8 +103,8 @@ def error_summary(exc: Exception) -> str:
         return 'Соединение с API не установлено; проверьте Ollama и LLM_BASE_URL'
     if isinstance(exc, httpx.TimeoutException):
         return 'Превышено время ожидания API (модель может загружаться)'
-    if isinstance(exc, RuntimeError):
-        return str(exc)
+    if isinstance(exc, (RuntimeError, ValueError, KeyError, IndexError, TypeError)):
+        return f'{type(exc).__name__}: {exc}'
     return type(exc).__name__
 
 
@@ -307,7 +307,9 @@ class ModelAPI:
         self.embedding_model = os.getenv('EMB_MODEL', 'BAAI/bge-m3')
         self.reranker_model = os.getenv('RERANKER_MODEL', 'Qwen3-Reranker-8B')
         self.llm_model = os.getenv('LLM_MODEL') or os.getenv('GEN_MODEL') or 'deepseek-v4.1-flash'
-        self.client = httpx.Client(timeout=httpx.Timeout(50.0, connect=10.0), follow_redirects=False)
+        # На первый ответ большой локальной модели может уйти больше минуты.
+        timeout = 180.0 if is_local_ollama(self.base) else 50.0
+        self.client = httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0), follow_redirects=False)
 
     def post(self, base: str, key: str, route: str, payload: dict) -> dict:
         if not base:
@@ -349,10 +351,41 @@ class ModelAPI:
         return response.get('results', response.get('data', []))
 
     def chat(self, messages: list[dict], max_tokens: int = 1600) -> str:
+        if is_local_ollama(self.base):
+            # Нативный Ollama API поддерживает think=false. Для Qwen3 это важно:
+            # при включённом thinking короткая генерация может завершиться с
+            # пустым content, даже если в ответе есть внутренние рассуждения.
+            root = self.base.removesuffix('/v1').rstrip('/')
+            result = self.client.post(
+                root + '/api/chat',
+                json={
+                    'model': self.llm_model,
+                    'messages': messages,
+                    'stream': False,
+                    'think': False,
+                    'options': {'temperature': 0, 'num_predict': max_tokens},
+                },
+            )
+            result.raise_for_status()
+            data = result.json()
+            if not isinstance(data, dict):
+                raise ValueError('Ollama вернула ответ не в формате JSON-объекта')
+            content = (data.get('message') or {}).get('content')
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError(
+                    'Ollama вернула пустой ответ на /api/chat с think=false; '
+                    'проверьте название модели и вывод ollama ps'
+                )
+            return content.strip()
+
+        # Для API организаторов и облачных моделей сохраняем OpenAI-совместимый формат.
         response = self.post(self.base, self.key, '/chat/completions',
                              {'model': self.llm_model, 'messages': messages,
                               'temperature': 0, 'max_tokens': max_tokens})
-        return str(response['choices'][0]['message'].get('content') or '').strip()
+        content = response['choices'][0]['message'].get('content')
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError('Модель вернула пустой ответ в поле choices[0].message.content')
+        return content.strip()
 
 
 class LegalAssistant:
@@ -477,6 +510,7 @@ class LegalAssistant:
         search_query = (previous[:500] + '\n' + question) if previous and len(question) < 120 else question
         candidates = self.search(search_query)
         if not candidates:
+            log('RAG: поиск не нашёл ни одного подходящего фрагмента')
             return {'answer': REFUSAL, 'sources': []}
         terms = set(words(search_query)) - STOP_WORDS
         max_overlap = max(len(terms.intersection(set(words(c['document'] + ' ' + c['text']))))
@@ -484,8 +518,10 @@ class LegalAssistant:
         max_lex = max(c['bm25_score'] for c in candidates)
         max_vec = max(c['vector_score'] for c in candidates)
         if max_overlap == 0 and max_vec < float(os.getenv('MIN_VECTOR_SCORE', '0.20')):
+            log('RAG: отказ по порогу поиска (нет общих слов и низкая векторная близость)')
             return {'answer': REFUSAL, 'sources': []}
         if max_lex <= 0 and max_vec < float(os.getenv('MIN_VECTOR_SCORE', '0.20')):
+            log('RAG: отказ по порогу поиска (BM25=0, низкая векторная близость)')
             return {'answer': REFUSAL, 'sources': []}
 
         snippets = '\n\n'.join(
@@ -511,15 +547,19 @@ class LegalAssistant:
         try:
             response = self.api.chat(messages)
         except (httpx.HTTPError, KeyError, IndexError, ValueError, RuntimeError, TypeError) as exc:
-            log(f'Генерация не удалась: {error_summary(exc)}')
-            return {'answer': REFUSAL, 'sources': []}
+            # Ошибка API — это НЕ отсутствие сведений в документах.
+            # Не подменяем технический сбой юридически обоснованным отказом.
+            detail = error_summary(exc)
+            log(f'Генерация не удалась: {detail}')
+            raise RuntimeError(f'Не удалось получить ответ от языковой модели: {detail}') from exc
         if not response:
-            return {'answer': REFUSAL, 'sources': []}
+            raise RuntimeError('Языковая модель вернула пустой ответ')
         cited = [int(x) for x in re.findall(r'\[S(\d+)\]', response, re.I)]
         refusal_words = ('недостаточно', 'не хватает', 'не содерж', 'невозможно', 'нет сведений',
                          'нет информации', 'не могу', 'за рамками', 'не относится')
         is_refusal = any(x in response.lower() for x in refusal_words)
         if not cited and not is_refusal:
+            log('RAG: модель ответила без ссылок [Sномер]; запрашиваю исправление')
             # Не выдаём пользователю ничем не подкреплённое юридическое утверждение.
             try:
                 correction = messages + [
@@ -534,6 +574,7 @@ class LegalAssistant:
                 pass
         if (not response or any(x < 1 or x > len(sources) for x in cited)
                 or (not cited and not is_refusal)):
+            log('RAG: итоговый ответ не прошёл проверку ссылок; возвращён отказ')
             return {'answer': REFUSAL, 'sources': sources}
         # Сообщаем только реально использованные документы; для отказа источники могут быть пустыми.
         used = set(cited)
@@ -654,6 +695,9 @@ def run_web(engine: LegalAssistant, host: str, port: int) -> None:
                 code = 200
             except (ValueError, json.JSONDecodeError) as exc:
                 result, code = {'error': str(exc)}, 400
+            except RuntimeError as exc:
+                # Информируем о недоступности LLM вместо ложного юридического отказа.
+                result, code = {'error': str(exc)}, 503
             except Exception as exc:
                 log(f'Ошибка сервера: {type(exc).__name__}')
                 result, code = {'error': 'Ошибка обработки вопроса'}, 500
